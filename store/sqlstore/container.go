@@ -27,8 +27,9 @@ import (
 
 // Container is a wrapper for a SQL database that can contain multiple whatsmeow sessions.
 type Container struct {
-	db  *dbutil.Database
-	log waLog.Logger
+	db     *dbutil.Database
+	log    waLog.Logger
+	LIDMap *CachedLIDMap
 
 	DatabaseErrorHandler func(device *store.Device, action string, attemptIndex int, err error) (retry bool)
 }
@@ -91,8 +92,9 @@ func NewWithWrappedDB(wrapped *dbutil.Database, log waLog.Logger) *Container {
 		log = waLog.Noop
 	}
 	return &Container{
-		db:  wrapped,
-		log: log,
+		db:     wrapped,
+		log:    log,
+		LIDMap: NewCachedLIDMap(wrapped),
 	}
 }
 
@@ -148,19 +150,7 @@ func (c *Container) scanDevice(row dbutil.Scannable) (*store.Device, error) {
 	device.Account = &account
 	device.FacebookUUID = fbUUID.UUID
 
-	innerStore := NewSQLStore(c, *device.ID)
-	device.Identities = innerStore
-	device.Sessions = innerStore
-	device.PreKeys = innerStore
-	device.SenderKeys = innerStore
-	device.AppStateKeys = innerStore
-	device.AppState = innerStore
-	device.Contacts = innerStore
-	device.ChatSettings = innerStore
-	device.MsgSecrets = innerStore
-	device.PrivacyTokens = innerStore
-	device.Container = c
-	device.Initialized = true
+	c.initializeDevice(&device)
 
 	return &device, nil
 }
@@ -270,20 +260,26 @@ func (c *Container) PutDevice(device *store.Device) error {
 		device.Platform, device.BusinessName, device.PushName, uuid.NullUUID{UUID: device.FacebookUUID, Valid: device.FacebookUUID != uuid.Nil})
 
 	if !device.Initialized {
-		innerStore := NewSQLStore(c, *device.ID)
-		device.Identities = innerStore
-		device.Sessions = innerStore
-		device.PreKeys = innerStore
-		device.SenderKeys = innerStore
-		device.AppStateKeys = innerStore
-		device.AppState = innerStore
-		device.Contacts = innerStore
-		device.ChatSettings = innerStore
-		device.MsgSecrets = innerStore
-		device.PrivacyTokens = innerStore
-		device.Initialized = true
+		c.initializeDevice(device)
 	}
 	return err
+}
+
+func (c *Container) initializeDevice(device *store.Device) {
+	innerStore := NewSQLStore(c, *device.ID)
+	device.Identities = innerStore
+	device.Sessions = innerStore
+	device.PreKeys = innerStore
+	device.SenderKeys = innerStore
+	device.AppStateKeys = innerStore
+	device.AppState = innerStore
+	device.Contacts = innerStore
+	device.ChatSettings = innerStore
+	device.MsgSecrets = innerStore
+	device.PrivacyTokens = innerStore
+	device.LIDs = c.LIDMap
+	device.Container = c
+	device.Initialized = true
 }
 
 // DeleteDevice deletes the given device from this database. This should be called through Device.Delete()

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"go.mau.fi/util/dbutil"
+	"go.mau.fi/util/exsync"
 
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
@@ -47,6 +48,8 @@ type SQLStore struct {
 
 	contactCache     map[types.JID]*types.ContactInfo
 	contactCacheLock sync.Mutex
+
+	migratedPNSessionsCache *exsync.Set[string]
 }
 
 // NewSQLStore creates a new SQLStore with the given database container and user JID.
@@ -58,10 +61,12 @@ func NewSQLStore(c *Container, jid types.JID) *SQLStore {
 		Container:    c,
 		JID:          jid.String(),
 		contactCache: make(map[types.JID]*types.ContactInfo),
+
+		migratedPNSessionsCache: exsync.NewSet[string](),
 	}
 }
 
-var _ store.AllStores = (*SQLStore)(nil)
+var _ store.AllSessionSpecificStores = (*SQLStore)(nil)
 
 const (
 	putIdentityQuery = `
@@ -111,6 +116,30 @@ const (
 	`
 	deleteAllSessionsQuery = `DELETE FROM whatsmeow_sessions WHERE our_jid=$1 AND their_id LIKE $2`
 	deleteSessionQuery     = `DELETE FROM whatsmeow_sessions WHERE our_jid=$1 AND their_id=$2`
+
+	migratePNToLIDSessionsQuery = `
+		INSERT INTO whatsmeow_sessions (our_jid, their_id, session)
+		SELECT our_jid, replace(their_id, $2, $3), session
+		FROM whatsmeow_sessions
+		WHERE our_jid=$1 AND their_id LIKE $2 || ':%'
+		ON CONFLICT (our_jid, their_id) DO UPDATE SET session=excluded.session
+	`
+	deleteAllIdentityKeysQuery      = `DELETE FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id LIKE $2`
+	migratePNToLIDIdentityKeysQuery = `
+		INSERT INTO whatsmeow_identity_keys (our_jid, their_id, identity)
+		SELECT our_jid, replace(their_id, $2, $3), identity
+		FROM whatsmeow_identity_keys
+		WHERE our_jid=$1 AND their_id LIKE $2 || ':%'
+		ON CONFLICT (our_jid, their_id) DO UPDATE SET identity=excluded.identity
+	`
+	deleteAllSenderKeysQuery      = `DELETE FROM whatsmeow_sender_keys WHERE our_jid=$1 AND sender_id LIKE $2`
+	migratePNToLIDSenderKeysQuery = `
+		INSERT INTO whatsmeow_sender_keys (our_jid, chat_id, sender_id, sender_key)
+		SELECT our_jid, chat_id, replace(sender_id, $2, $3), sender_key
+		FROM whatsmeow_sender_keys
+		WHERE our_jid=$1 AND sender_id LIKE $2 || ':%'
+		ON CONFLICT (our_jid, chat_id, sender_id) DO UPDATE SET sender_key=excluded.sender_key
+	`
 )
 
 func (s *SQLStore) GetSession(address string) (session []byte, err error) {
@@ -135,13 +164,86 @@ func (s *SQLStore) PutSession(address string, session []byte) error {
 }
 
 func (s *SQLStore) DeleteAllSessions(phone string) error {
-	_, err := s.db.Exec(context.TODO(), deleteAllSessionsQuery, s.JID, phone+":%")
+	return s.deleteAllSessions(context.TODO(), phone)
+}
+
+func (s *SQLStore) deleteAllSessions(ctx context.Context, phone string) error {
+	_, err := s.db.Exec(ctx, deleteAllSessionsQuery, s.JID, phone+":%")
+	return err
+}
+
+func (s *SQLStore) deleteAllSenderKeys(ctx context.Context, phone string) error {
+	_, err := s.db.Exec(ctx, deleteAllSenderKeysQuery, s.JID, phone+":%")
+	return err
+}
+
+func (s *SQLStore) deleteAllIdentityKeys(ctx context.Context, phone string) error {
+	_, err := s.db.Exec(ctx, deleteAllIdentityKeysQuery, s.JID, phone+":%")
 	return err
 }
 
 func (s *SQLStore) DeleteSession(address string) error {
 	_, err := s.db.Exec(context.TODO(), deleteSessionQuery, s.JID, address)
 	return err
+}
+
+func (s *SQLStore) MigratePNToLID(ctx context.Context, pn, lid types.JID) error {
+	pnSignal := pn.SignalAddressUser()
+	if !s.migratedPNSessionsCache.Add(pnSignal) {
+		return nil
+	}
+	var sessionsUpdated, identityKeysUpdated, senderKeysUpdated int64
+	lidSignal := lid.SignalAddressUser()
+	err := s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
+		res, err := s.db.Exec(ctx, migratePNToLIDSessionsQuery, s.JID, pnSignal, lidSignal)
+		if err != nil {
+			return fmt.Errorf("failed to migrate sessions: %w", err)
+		}
+		sessionsUpdated, err = res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("failed to get rows affected for sessions: %w", err)
+		}
+		err = s.deleteAllSessions(ctx, pnSignal)
+		if err != nil {
+			return fmt.Errorf("failed to delete extra sessions: %w", err)
+		}
+
+		res, err = s.db.Exec(ctx, migratePNToLIDIdentityKeysQuery, s.JID, pnSignal, lidSignal)
+		if err != nil {
+			return fmt.Errorf("failed to migrate identity keys: %w", err)
+		}
+		identityKeysUpdated, err = res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("failed to get rows affected for identity keys: %w", err)
+		}
+		err = s.deleteAllIdentityKeys(ctx, pnSignal)
+		if err != nil {
+			return fmt.Errorf("failed to delete extra identity keys: %w", err)
+		}
+
+		res, err = s.db.Exec(ctx, migratePNToLIDSenderKeysQuery, s.JID, pnSignal, lidSignal)
+		if err != nil {
+			return fmt.Errorf("failed to migrate sender keys: %w", err)
+		}
+		senderKeysUpdated, err = res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("failed to get rows affected for sender keys: %w", err)
+		}
+		err = s.deleteAllSenderKeys(ctx, pnSignal)
+		if err != nil {
+			return fmt.Errorf("failed to delete extra sender keys: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if sessionsUpdated > 0 || senderKeysUpdated > 0 || identityKeysUpdated > 0 {
+		s.log.Infof("Migrated %d sessions, %d identity keys and %d sender keys from %s to %s", sessionsUpdated, identityKeysUpdated, senderKeysUpdated, pnSignal, lidSignal)
+	} else {
+		s.log.Debugf("No sessions or sender keys found to migrate from %s to %s", pnSignal, lidSignal)
+	}
+	return nil
 }
 
 const (
