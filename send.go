@@ -1013,9 +1013,9 @@ func buildBizNode(msg *waE2E.Message, buttonType string) waBinary.Node {
 			return waBinary.Node{
 				Tag: "biz",
 				Attrs: waBinary.Attrs{
-					"actual_actors":    "2",
-					"host_storage":     "2",
-					"privacy_mode_ts":  privacyTS,
+					"actual_actors":   "2",
+					"host_storage":    "2",
+					"privacy_mode_ts": privacyTS,
 				},
 				Content: []waBinary.Node{
 					{
